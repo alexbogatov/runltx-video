@@ -10,6 +10,8 @@ echo "===================================================="
 # 1. Platform & GPU Auto-Discovery
 if [ -n "$MODAL_TASK_ID" ] || [ -n "$MODAL_IS_REMOTE" ] || [ -n "$MODAL_ENVIRONMENT" ]; then
     export RUNNER_PLATFORM="modal"
+elif [ -n "$VAST_CONTAINERLABEL" ] || [ -n "$CONTAINER_ID" ] || [ -n "$VAST_TCP_PORT_22" ]; then
+    export RUNNER_PLATFORM="vastai"
 elif [ -n "$HYPERSTACK_API_KEY" ]; then
     export RUNNER_PLATFORM="hyperstack"
 else
@@ -157,7 +159,7 @@ curl -s -X POST "${API_BASE_URL}/v1/worker/off" \
 
 echo "[Billing] Session closed."
 
-# Trigger Hyperstack VM Hibernation
+# --- Hyperstack Hibernation ---
 if [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
     echo "[Teardown] Requesting Hyperstack VM Hibernation for host: ${MACHINE_ID}..."
     HYPERSTACK_API_URL="${HYPERSTACK_API_URL:-https://infrahub-api.nexgencloud.com/v1}"
@@ -177,6 +179,27 @@ if [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
         echo "[Teardown] Hibernating VM ${VM_ID}..."
         curl -s -H "api_key: ${HYPERSTACK_API_KEY}" \
             "${HYPERSTACK_API_URL}/core/virtual-machines/${VM_ID}/hibernate?retain_ip=true" || true
+    fi
+
+# --- Vast.ai Stop Instance ---
+elif [ "$RUNNER_PLATFORM" = "vastai" ]; then
+    echo "[Teardown] Shutting down Vast.ai instance to prevent idle compute charges..."
+    
+    # Resolve instance ID: checks CONTAINER_ID, VAST_CONTAINERLABEL, or hostname
+    VAST_ID="${CONTAINER_ID:-${VAST_CONTAINERLABEL:-${MACHINE_ID}}}"
+
+    if [ -n "$CONTAINER_API_KEY" ] && [ -n "$VAST_ID" ]; then
+        echo "[Teardown] Calling Vast.ai REST API for instance ${VAST_ID}..."
+        curl -s -X PUT "https://console.vast.ai/api/v0/instances/${VAST_ID}/" \
+            -H "Authorization: Bearer ${CONTAINER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"state": "stopped"}' || true
+    elif command -v vastai >/dev/null 2>&1 && [ -n "$VAST_ID" ]; then
+        echo "[Teardown] Calling vastai CLI for instance ${VAST_ID}..."
+        vastai stop instance "$VAST_ID" || true
+    else
+        echo "[Teardown] No Vast API key or CLI found inside container. Terminating PID 1..."
+        kill -s TERM 1 2>/dev/null || true
     fi
 fi
 
