@@ -8,11 +8,42 @@ echo "[Startup] Initializing LTX 2.5 Runner Environment"
 echo "===================================================="
 
 # 1. Platform & GPU Auto-Discovery
+#
+# HYPERSTACK_API_KEY is present in the env file on EVERY platform (it is shared
+# config), so a bare key check misdetects everything as hyperstack. Probe the
+# actual machine instead.
+is_hyperstack() {
+    # 1. OpenStack / NexGen Cloud instance metadata
+    if curl -s --connect-timeout 1 http://169.254.169.254/openstack/latest/meta_data.json 2>/dev/null | grep -qi "nexgen\|hyperstack"; then
+        return 0
+    fi
+
+    # 2. DMI BIOS / product identifiers
+    local dmi_data
+    dmi_data="$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/chassis_asset_tag 2>/dev/null || true)"
+    if echo "$dmi_data" | grep -qi "nexgen\|hyperstack"; then
+        return 0
+    fi
+
+    # 3. Hyperstack agent / provision flags from VM bootstrap
+    if [ -d "/etc/hyperstack" ] || [ -f "/var/log/hyperstack-init.log" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
 if [ -n "$MODAL_TASK_ID" ] || [ -n "$MODAL_IS_REMOTE" ] || [ -n "$MODAL_ENVIRONMENT" ]; then
     export RUNNER_PLATFORM="modal"
 elif [ -n "$VAST_CONTAINERLABEL" ] || [ -n "$CONTAINER_ID" ] || [ -n "$VAST_TCP_PORT_22" ]; then
     export RUNNER_PLATFORM="vastai"
-elif [ -n "$HYPERSTACK_API_KEY" ]; then
+elif [ -n "$LIUM_POD_ID" ] || [ -f "/etc/lium/pod.json" ] || [ -d "/lium-cipher" ]; then
+    # Lium mounts its cipher volume at /lium-cipher and its k0s root is
+    # distinctive. LIUM_POD_ID (injected by .admin/deploy.lium.sh) is the
+    # strongest signal, but deploy.lium.sh may be pasted without it, so fall
+    # back to filesystem markers rather than to the shared API key.
+    export RUNNER_PLATFORM="lium"
+elif is_hyperstack; then
     export RUNNER_PLATFORM="hyperstack"
 else
     export RUNNER_PLATFORM="generic"
@@ -159,8 +190,43 @@ curl -s -X POST "${API_BASE_URL}/v1/worker/off" \
 
 echo "[Billing] Session closed."
 
+# --- Lium Pod Deletion ---
+if [ "$RUNNER_PLATFORM" = "lium" ]; then
+    echo "[Teardown] Shutting down Lium pod to prevent idle compute charges..."
+    LIUM_API_URL="${LIUM_API_URL:-https://lium.io/api}"
+
+    if [ -z "$LIUM_API_KEY" ]; then
+        echo "[Teardown] LIUM_API_KEY not set; cannot delete pod. Terminating PID 1..."
+        kill -s TERM 1 2>/dev/null || true
+    else
+        # Identity comes only from LIUM_POD_ID, injected by .admin/deploy.lium.sh.
+        # It is never inferred: $HOSTNAME is a 12-char container id the API
+        # rejects (422 uuid_parsing), and a name lookup from inside the pod
+        # cannot reliably single this pod out - guessing wrong would delete
+        # somebody else's pod on idle teardown.
+        LIUM_ID="${LIUM_POD_ID:-${LIUM_POD_UUID:-}}"
+
+        if [ -z "$LIUM_ID" ]; then
+            echo "[Teardown] LIUM_POD_ID is empty; skipping Lium API delete."
+            echo "[Teardown] Set LIUM_POD_ID in .env at deploy time to enable self-deletion."
+            echo "[Teardown] The pod will keep billing until stopped from the Lium dashboard."
+        elif [[ "$LIUM_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            # Fire and forget: the DELETE tears down this pod, which kills the
+            # container mid-request, so the response is never received or logged.
+            echo "[Teardown] Deleting Lium pod ${LIUM_ID}..."
+            curl -s -X DELETE "${LIUM_API_URL}/pods/${LIUM_ID}" \
+                -H "X-API-Key: ${LIUM_API_KEY}" \
+                -H "accept: application/json" >/dev/null 2>&1 || true
+        else
+            echo "[Teardown] LIUM_POD_ID is not a valid 36-char UUID (got '${LIUM_ID}')."
+            echo "[Teardown] Refusing to delete; stop the pod from the Lium dashboard."
+        fi
+
+        kill -s TERM 1 2>/dev/null || true
+    fi
+
 # --- Hyperstack Hibernation ---
-if [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
+elif [ "$RUNNER_PLATFORM" = "hyperstack" ] && [ -n "$HYPERSTACK_API_KEY" ]; then
     echo "[Teardown] Requesting Hyperstack VM Hibernation for host: ${MACHINE_ID}..."
     HYPERSTACK_API_URL="${HYPERSTACK_API_URL:-https://infrahub-api.nexgencloud.com/v1}"
     
